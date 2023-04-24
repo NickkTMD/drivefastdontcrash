@@ -1,3 +1,6 @@
+CS 3892 Final Project
+Contributors: Aadi Bajpai, Julian Delgado, Caden Felton, Nick Gebo
+
 # VehicleSim
 VehicleSim
 
