@@ -19,8 +19,6 @@ function opposite(direction::Direction)
     direction == west && return east
 end
 
-
-
 """
 Assume that pt_b is further along driving direction than pt_a
 """
@@ -55,24 +53,65 @@ mutable struct RoadSegment
     children::Vector{Int}
 end
 
-function get_segment(map::Dict{Int, RoadSegment}, pt::SVector{3, Float64})
-
-    for (id, seg) in map
-        if inside_segment(pt, seg)
-            return seg.id
-        end
-    end
+function get_segments(map::Dict{Int, RoadSegment}, point)
+    return get_segments(map, point)
 end
 
-using LazySets, Polyhedra
+"""
+Get the segments that point is in 
+"""
+function get_segments(map::Dict{Int, RoadSegment}, point)
 
-function inside_segment(x, seg)
+    segments = Dict{Int, RoadSegment}()
 
-    # @info "Checking if $(x[1:2]) is inside segment $(seg.id) with $(length(seg.lane_boundaries)) lanes"
+    for (id, seg) in map
+        if inside_segment(point, seg)
+            segments[id] = seg
+        end
+    end
+
+    segments
+end
+
+"""
+Check if point is in the segment with seg id
+"""
+function inside_segment(map::Dict{Int, RoadSegment}, point, seg_id)
+
+
+    seg = map[seg_id]
+
+    return inside_segment(SVector(point[1], point[2], 0), seg)
+
+end
+
+"""
+Check if point is in the segment with seg id
+"""
+function inside_segment_or_child(map::Dict{Int, RoadSegment}, point, seg_id::Integer)
+
+    seg = map[seg_id]
+
+    if inside_segment(SVector(point[1], point[2], 0), seg)
+        return true
+    end
+
+    for child in seg.children
+        if inside_segment(map, point, child)
+            return true
+        end
+    end
+
+    false
+end
+
+"""
+Check if point is in the segment RoadSegment
+"""
+function inside_segment(point, seg::RoadSegment; lane_width=10.0)
 
     # check if straight segment
     if isapprox(seg.lane_boundaries[1].curvature, 0.0; atol=1e-6) 
-
         pts = Vector{SVector{2,Float64}}()
 
         for lb in seg.lane_boundaries
@@ -80,26 +119,59 @@ function inside_segment(x, seg)
             push!(pts, lb.pt_b)
         end
 
-        # use LazySets.jl to create a V polyhedra of the points
-
-        P1 = convex_hull(pts)
-        P = VPolytope(P1)
-
-        #P1 = polyhedron(vrep(pts), lib)
-
-        # use Polyhedra.jl to create a V polyhedra of the points
-        # then check if x is inside
-        # poly = ConvexHull(pts)
-        inBounds = x[1:2] ∈ P # poly
+        # use LazySets.jl to create a polyhedra of the points
+        P = VPolytope(convex_hull(pts))
         
-        @info "In bounds? $inBounds"
-        return inBounds
+        return point[1:2] ∈ P # poly
     else
         # todo curves
-        # inside_rad = 1.0 / curvature
-        # middle_rad = inside_rad + lane_width
-        # outside_rad = middle_rad + lane_width
-        # return inside_rad <= norm(x[1:2] - pt_a[1:2]) <= outside_rad
+        inside_rad = -1
+        outside_rad = -1
+
+        pt_a = seg.lane_boundaries[1].pt_a
+        pt_b = seg.lane_boundaries[1].pt_b
+
+        pt_c = seg.lane_boundaries[2].pt_a
+        pt_d = seg.lane_boundaries[2].pt_b
+
+        right = seg.lane_boundaries[2].curvature < 0
+
+        if (right)
+            curvature = seg.lane_boundaries[2].curvature
+            inside_rad = abs(1.0 / curvature)
+            outside_rad = inside_rad + lane_width
+
+            center = pt_d - normalize(pt_b - pt_d) * inside_rad
+        else
+            curvature = seg.lane_boundaries[1].curvature
+            inside_rad = abs(1.0 / curvature)
+            outside_rad = inside_rad + lane_width
+
+            center = pt_b - normalize(pt_d - pt_b) * inside_rad
+        end    
+
+        inRange = inside_rad <= norm(point[1:2] - center) <= outside_rad
+
+        if (inRange)
+            # calculate angle between center and x
+
+            startingAngle = -1
+            finalAngle = -1
+
+            # this can definitely be compressed but theirs weirdness with overflow i.e. 0 deg / 360 deg so leaving as it works
+            if right
+                startingAngle = mod(180/π * atan(pt_d[2] - center[2], pt_d[1] - center[1]), 360)
+                finalAngle = mod(180/π * atan(pt_c[2] - center[2], pt_c[1] - center[1]) - 1e-6, 360)
+            else
+                startingAngle = mod(180/π * atan(pt_c[2] - center[2], pt_c[1] - center[1]), 360)
+                finalAngle = mod(180/π * atan(pt_d[2] - center[2], pt_d[1] - center[1]) - 1e-6, 360)
+            end
+
+            curAngle = mod(180/π * atan(point[2] - center[2], point[1] - center[1]), 360)
+
+            return startingAngle <= curAngle <= finalAngle
+        end
+
         return false
     end
 
@@ -176,16 +248,6 @@ function generate_laneline_mesh(lb::LaneBoundary; res=1.0, width=0.3, seg_id=-1)
     faces = mapreduce(vcat, 1:K-1) do k
         [GeometryBasics.TriangleFace((k-1)*2+1,k*2+1,k*2+2),
          GeometryBasics.TriangleFace((k-1)*2+1,k*2,k*2+2)]
-    end
-
-    # render id text with meshcat
-    if seg_id in [32, 37]
-        color = RGBA{Float32}(1,0,0)
-    end
-
-    if seg_id in [39]
-
-        color = RGBA{Float32}(0,0,1)
     end
 
     mesh = GeometryBasics.Mesh(points, faces)
@@ -294,8 +356,24 @@ function generate_lane_mesh(lb1, lb2, lane_type; width=0.3, res=1.0)
     (; obj, obj_end)
 end
 
+function ground_mesh()
+    green=RGBA{Float32}(0.34,0.49,0.27,1.0)
+    points = GeometryBasics.Point{3,Float64}[]
+    for x in [-200.0, 200.0]
+        for y in [-200.0, 200.0]
+            push!(points, GeometryBasics.Point{3,Float64}(x,y,-0.25))
+        end
+    end
+    faces = [GeometryBasics.TriangleFace(1,2,3), GeometryBasics.TriangleFace(2,4,3)]
+    mesh = GeometryBasics.Mesh(points, faces)
+    obj = MeshCat.Object(mesh, MeshPhongMaterial(color=green))
+end
+
+
 function view_map(vis, all_segs)
     delete!(vis["Grid"])
+    gm = ground_mesh()
+    setobject!(vis["ground"], gm)
     for (id, seg) in all_segs
         meshes = generate_road_segment_mesh(seg)
         for (mesh_id, m) in meshes
@@ -307,13 +385,79 @@ function view_map(vis, all_segs)
     end
 end
 
-function generate_road_segment_mesh(seg; lane_width=0.3, poly_res=1.0)
+function generate_road_segment_mesh(seg; laneline_width=0.3, lane_width=10.0, poly_res=1.0)
 
     meshes = Dict{String, Any}()
 
-    curved = !isapprox(seg.lane_boundaries[1].curvature, 0.0; atol=1e-6)
+    curvature = seg.lane_boundaries[1].curvature
+    curved = !isapprox(curvature, 0.0; atol=1e-6)
 
-    if (!curved)
+    if (curved)
+        right = curvature < 0
+
+        pt_b = seg.lane_boundaries[1].pt_b
+        pt_c = seg.lane_boundaries[2].pt_a
+        pt_d = seg.lane_boundaries[2].pt_b
+
+        inside_rad = -1
+        outside_rad = -1
+
+        N = 10
+        dθ = (π/2) / N # (finalAngle - startingAngle) / N
+        startingAngle = -1
+        color = RGBA{Float32}(0, 0, 1, 1.0)
+
+        if right
+            curvature = seg.lane_boundaries[2].curvature
+            inside_rad = abs(1.0 / curvature)
+            outside_rad = inside_rad + lane_width
+
+            center = pt_d - normalize(pt_b - pt_d) * inside_rad
+            
+            startingAngle = atan(pt_d[2] - center[2], pt_d[1] - center[1])
+            color = RGBA{Float32}(1, 0, 0, 1.0)
+
+            # # render a sphere at center
+            # mesh = GeometryBasics.Sphere(GeometryBasics.Point{3,Float64}(center[1], center[2], 1), .5)
+            # obj = MeshCat.Object(mesh, MeshPhongMaterial(color=RGBA{Float32}(1,0,0,1)))
+            # meshes["nick_center_$(seg.id)"] = obj
+        else
+            curvature = seg.lane_boundaries[1].curvature
+            inside_rad = abs(1.0 / curvature)
+            outside_rad = inside_rad + lane_width
+
+            center = pt_b - normalize(pt_d - pt_b) * inside_rad
+
+            startingAngle = atan(pt_c[2] - center[2], pt_c[1] - center[1])
+            color = RGBA{Float32}(1, 0, 1, 1.0)
+        end
+
+        # get points of curve
+        points = Vector{GeometryBasics.Point{3,Float64}}()
+        faces = Vector{GeometryBasics.TriangleFace{Int}}()
+
+        θ0 = startingAngle
+
+        # use map reduce to get points
+        points = mapreduce(vcat, 0:N) do i
+            θ = θ0 + dθ * i
+            [GeometryBasics.Point{3,Float64}(center[1]+inside_rad*cos(θ), center[2]+inside_rad*sin(θ), .1),
+             GeometryBasics.Point{3,Float64}(center[1]+outside_rad*cos(θ), center[2]+outside_rad*sin(θ), .1)]
+        end
+
+        K = length(points)/2 |> Int
+
+        # generate faces
+        faces = mapreduce(vcat, 1:K-1) do k
+            [GeometryBasics.TriangleFace((k-1)*2+1,k*2+1,k*2+2),
+             GeometryBasics.TriangleFace((k-1)*2+1,k*2,k*2+2)]
+        end
+
+        mesh = GeometryBasics.Mesh(points, faces)
+        obj = MeshCat.Object(mesh, MeshPhongMaterial(color=color))
+
+        meshes["nick_$(seg.id)"] = obj
+    else    
         pts = Vector{SVector{2,Float64}}()
     
         for lb in seg.lane_boundaries
@@ -333,7 +477,7 @@ function generate_road_segment_mesh(seg; lane_width=0.3, poly_res=1.0)
         faces = Vector{GeometryBasics.TriangleFace{Int}}()
 
         for p in P.vertices
-            push!(points, GeometryBasics.Point{3,Float64}(p[1], p[2], 1))
+            push!(points, GeometryBasics.Point{3,Float64}(p[1], p[2], .1))
         end
 
         for i in 1:length(P.vertices)-2
@@ -344,19 +488,10 @@ function generate_road_segment_mesh(seg; lane_width=0.3, poly_res=1.0)
         obj = MeshCat.Object(mesh, MeshPhongMaterial(color=color))
 
         meshes["nick_$(seg.id)"] = obj
-
-        # render a polygon mesh
-        # points = Vector{GeometryBasics.Point{3,Float64}}()
-        # faces = Vector{GeometryBasics.TriangleFace{Int}}()
-
-        # mesh = GeometryBasics.Mesh(points, faces)
-        # obj = MeshCat.Object(mesh, MeshPhongMaterial(color=color))
-
-        # meshes["circle"] = obj
     end
 
     for (e,lb) in enumerate(seg.lane_boundaries)
-        m = generate_laneline_mesh(lb; width=lane_width, res=poly_res, seg_id=seg.id)
+        m = generate_laneline_mesh(lb; width=laneline_width, res=poly_res, seg_id=seg.id)
         meshes["line_$e"] = m
         if e ≤ length(seg.lane_types)
             ms = generate_lane_mesh(lb, seg.lane_boundaries[e+1], seg.lane_types[e]; res=poly_res)
@@ -374,10 +509,18 @@ function contains_lane_type(seg, types...)
     return any(lane_type ∈ types for lane_type in seg.lane_types)
 end
 
+function istaper(seg)
+    A = seg.lane_boundaries[2].pt_a
+    B = seg.lane_boundaries[2].pt_b
+    C = seg.lane_boundaries[3].pt_a
+    D = seg.lane_boundaries[3].pt_b
+    norm(A-C) < 0.1 || norm(B-D) < 0.1
+end
+
 function identify_loading_segments(map)
     target_segments = []
     for (id, seg) in map
-        if contains_lane_type(seg, loading_zone)
+        if contains_lane_type(seg, loading_zone) && !istaper(seg)
             push!(target_segments, id)
         end
     end
@@ -454,31 +597,26 @@ function training_map(; lane_width = 10.0,
     segs = add_straight_segments!(all_segs, segs_I, west; length=block_length, speed_limit, stop_outbound=true, stop_inbound=true)
     segs_T = add_T_intersection!(all_segs, segs, west, east; intersection_curvature, lane_width, speed_limit)
    
-   
-   
     segs_S = add_pullout_segments!(all_segs, segs_T, south; length=block_length, pullout_length, pullout_taper, lane_width, speed_limit, pullout_inbound=false, pullout_outbound=true)
     segs_S = add_curved_segments!(all_segs, segs_S, south, true; turn_curvature, speed_limit, lane_width)
     segs_S = add_pullout_segments!(all_segs, segs_S, east; length=shortened_block_length, pullout_length, pullout_taper, lane_width, speed_limit, pullout_inbound=true, pullout_outbound=false)
     segs_S = add_curved_segments!(all_segs, segs_S, east, true; turn_curvature, speed_limit, lane_width)
     segs_S = add_straight_segments!(all_segs, segs_S, north; length=block_length, speed_limit, stop_outbound=true, stop_inbound=false)
     segs_I = add_segments!(all_segs, segs_S, north, segs_I)
-
-
-
     
-    # segs_N = add_pullout_segments!(all_segs, segs_T, north; length=single_shortened_block_length, pullout_length, pullout_taper, lane_width, speed_limit, pullout_inbound=true, pullout_outbound=false)
-    # segs_N = add_curved_segments!(all_segs, segs_N, north, false; turn_curvature, speed_limit, lane_width)
-    # segs_N = add_straight_segments!(all_segs, segs_N, east; length=single_shortened_block_length, speed_limit, stop_outbound=true, stop_inbound=false)
-    # segs_N = add_T_intersection!(all_segs, segs_N, east, south; intersection_curvature, lane_width, speed_limit)
-    # segs_N2 = add_pullout_segments!(all_segs, segs_N, south; length=block_length, pullout_length, pullout_taper, lane_width, speed_limit, pullout_inbound=true, pullout_outbound=true, stop_inbound=true, stop_outbound=true)
-    # segs_I = add_segments!(all_segs, segs_N2, south, segs_I)
+    segs_N = add_pullout_segments!(all_segs, segs_T, north; length=single_shortened_block_length, pullout_length, pullout_taper, lane_width, speed_limit, pullout_inbound=true, pullout_outbound=false)
+    segs_N = add_curved_segments!(all_segs, segs_N, north, false; turn_curvature, speed_limit, lane_width)
+    segs_N = add_straight_segments!(all_segs, segs_N, east; length=single_shortened_block_length, speed_limit, stop_outbound=true, stop_inbound=false)
+    segs_N = add_T_intersection!(all_segs, segs_N, east, south; intersection_curvature, lane_width, speed_limit)
+    segs_N2 = add_pullout_segments!(all_segs, segs_N, south; length=block_length, pullout_length, pullout_taper, lane_width, speed_limit, pullout_inbound=true, pullout_outbound=true, stop_inbound=true, stop_outbound=true)
+    segs_I = add_segments!(all_segs, segs_N2, south, segs_I)
 
-    # segs_E = add_straight_segments!(all_segs, segs_N, east; length=block_length, speed_limit, lane_width, stop_inbound=true, stop_outbound=false)
-    # segs_E = add_curved_segments!(all_segs, segs_E, east, false; turn_curvature, speed_limit, lane_width)
-    # segs_E = add_pullout_segments!(all_segs, segs_E, south; length=shortened_block_length, pullout_length, pullout_taper, lane_width, speed_limit, pullout_inbound=true, pullout_outbound=false)
-    # segs_E = add_curved_segments!(all_segs, segs_E, south, false; turn_curvature, speed_limit, lane_width)
-    # segs_E = add_straight_segments!(all_segs, segs_E, west; length=block_length, speed_limit, lane_width, stop_outbound=true, stop_inbound=false)
-    # segs_I = add_segments!(all_segs, segs_E, west, segs_I)
+    segs_E = add_straight_segments!(all_segs, segs_N, east; length=block_length, speed_limit, lane_width, stop_inbound=true, stop_outbound=false)
+    segs_E = add_curved_segments!(all_segs, segs_E, east, false; turn_curvature, speed_limit, lane_width)
+    segs_E = add_pullout_segments!(all_segs, segs_E, south; length=shortened_block_length, pullout_length, pullout_taper, lane_width, speed_limit, pullout_inbound=true, pullout_outbound=false)
+    segs_E = add_curved_segments!(all_segs, segs_E, south, false; turn_curvature, speed_limit, lane_width)
+    segs_E = add_straight_segments!(all_segs, segs_E, west; length=block_length, speed_limit, lane_width, stop_outbound=true, stop_inbound=false)
+    segs_I = add_segments!(all_segs, segs_E, west, segs_I)
 
     all_segs
 end

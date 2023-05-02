@@ -1,12 +1,97 @@
+struct SimpleVehicleState
+    p1::Float64
+    p2::Float64
+    θ::Float64
+    v::Float64
+    l::Float64
+    w::Float64
+    h::Float64
+end
+
+struct FullVehicleState
+    position::SVector{3, Float64}
+    velocity::SVector{3, Float64}
+    orientation::SVector{3, Float64}
+    angular_vel::SVector{3, Float64}
+end
+
 struct MyLocalizationType
-    field1::Int
-    field2::Float64
+    last_update::Float64
+    x::FullVehicleState
 end
 
 struct MyPerceptionType
-    field1::Int
-    field2::Float64
+    last_update::Float64
+    x::Vector{SimpleVehicleState}
 end
+
+function test_algorithms(gt_channel,
+        localization_state_channel,
+        perception_state_channel, 
+        ego_vehicle_id)
+    estimated_vehicle_states = Dict{Int, Tuple{Float64, Union{SimpleVehicleState, FullVehicleState}}}
+    gt_vehicle_states = Dict{Int, GroundTruthMeasuremen}
+
+    t = time()
+    while true
+
+        while isready(gt_channel)
+            meas = take!(gt_channel)
+            id = meas.vehicle_id
+            if meas.time > gt_vehicle_states[id].time
+                gt_vehicle_states[id] = meas
+            end
+        end
+
+        latest_estimated_ego_state = fetch(localization_state_channel)
+        latest_true_ego_state = gt_vehicle_states[ego_vehicle_id]
+        if latest_estimated_ego_state.last_update < latest_true_ego_state.time - 0.5
+            @warn "Localization algorithm stale."
+        else
+            estimated_xyz = latest_estimated_ego_state.position
+            true_xyz = latest_true_ego_state.position
+            position_error = norm(estimated_xyz - true_xyz)
+            t2 = time()
+            if t2 - t > 5.0
+                @info "Localization position error: $position_error"
+                t = t2
+            end
+        end
+
+        latest_perception_state = fetch(perception_state_channel)
+        last_perception_update = latest_perception_state.last_update
+        vehicles = last_perception_state.x
+
+        for vehicle in vehicles
+            xy_position = [vehicle.p1, vehicle.p2]
+            closest_id = 0
+            closest_dist = Inf
+            for (id, gt_vehicle) in gt_vehicle_states
+                if id == ego_vehicle_id
+                    continue
+                else
+                    gt_xy_position = gt_vehicle_position[1:2]
+                    dist = norm(gt_xy_position-xy_position)
+                    if dist < closest_dist
+                        closest_id = id
+                        closest_dist = dist
+                    end
+                end
+            end
+            paired_gt_vehicle = gt_vehicle_states[closest_id]
+
+            # compare estimated to GT
+
+            if last_perception_update < paired_gt_vehicle.time - 0.5
+                @info "Perception upate stale"
+            else
+                # compare estimated to true size
+                estimated_size = [vehicle.l, vehicle.w, vehicle.h]
+                actual_size = paired_gt_vehicle.size
+                @info "Estimated size error: $(norm(actual_size-estimated_size))"
+            end
+        end
+    end
 
 function localize(gps_channel, imu_channel, localization_state_channel)
     # Set up algorithm / initialize variables
@@ -53,36 +138,172 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
     end
 end
 
+using Rotations
+
+function get_current_state(latest_gt::GroundTruthMeasurement)
+    pos = latest_gt.position
+
+    angle = latest_gt.orientation
+    yaw = QuaternionToYaw(angle)
+    velo = latest_gt.velocity
+ 
+    [pos[1], pos[2], velo[1], yaw]
+end
+
+target_map_segment = 24 # -1 # (not a valid segment, will be overwritten by message)
+
 function decision_making(localization_state_channel, 
         perception_state_channel, 
         gt_channel, # for testing
         map, 
-        #target_road_segment_id, 
         socket)
     # do some setup
 
+    # wait 5 seconds for location to be set
+    @info "Waiting 5 to get accurate location info"
+    sleep(1) # TODO Wait 5
+
+    timestep=0.5
+    
+    @info "Creating callback gen"
+    callbacks = create_callback_generator(max_vel=5.0, timestep=timestep, trajectory_length=4)
+
+    # get initial state
+    latest_gt = fetch(gt_channel)
+    state = get_current_state(latest_gt)
+
+    # get our first trajectory
+    lastPath = []
+    trajectory = nothing
+    current_step = 1
+    helicopterMode = false
+
+    # Continuously generate new trajectories and save them
+    errormonitor(@async while true
+        # get latest state
+        latest_gt = fetch(gt_channel)
+        state = get_current_state(latest_gt)
+
+        curr_seg_id = nothing
+        for seg_id in lastPath
+            if inside_segment(state[1:2], map[seg_id])
+                curr_seg_id = seg_id
+                break
+            end
+        end
+
+        if (curr_seg_id === nothing)
+
+            current_segments = get_segments(map, state[1:2])
+
+            if (length(current_segments) == 0)
+                @info "Not on map, houston we are fucked"
+
+                @info "INITIALIZING HELICOPTER MODE"
+                helicopterMode = true
+
+                curr_seg_id = lastPath[1]
+            else
+
+                # grab any element from map
+
+                for (k, v) in current_segments
+                    curr_seg_id = k
+                    break
+                end
+            end
+        end
+
+        # we are not on the path, so we need to find a new path
+        @info "Finding new path"
+        lastPath = find_path(curr_seg_id, target_map_segment)
+
+        if (length(lastPath) == 1)
+            lastPath = [lastPath;lastPath]
+        end
+
+        if (length(lastPath) == 0)
+            sleep(1)
+            continue
+        end
+
+        trajectory = generate_trajectory(state, lastPath[1:2], target_map_segment, callbacks, map=map)
+
+        sleep(2 * timestep)
+
+        # could always sleep
+
+        current_step = 1
+    end
+    )
+
+    alternate = 1
+
     while true
 
-        latest_gt = fetch(gt_channel)
+        @info "loop "
+        
+        sleep(timestep)
 
-        # latest_perception_state = fetch(perception_state_channel)
+        if (helicopterMode)
 
-        # latest_gt_state = fetch(gt_channel)
+            @info "Helicopter mode"
 
-        #print("Pos: " + str(latest_gt.position) + "\n")
+            alternate = -alternate
 
-        # figure out what to do ... setup motion planning problem etc
-        steering_angle = 0.0
-        target_vel = 10
-        cmd = VehicleCommand(steering_angle, target_vel, true)
-        serialize(socket, cmd)
+            cmd = VehicleCommand(10, alternate, true)
+            serialize(socket, cmd)
+
+        else
+            # No trajectory calculated yet
+            if (trajectory === nothing) 
+                @info "Waiting on trajectory..."
+            else
+                states, controls = decompose_trajectory(trajectory)
+
+                @info "Decomposed trajectory"
+
+                if length(states) >= current_step
+                    # apply the current step controls
+                    target_angle = controls[current_step][2]
+                    target_velo = states[current_step][3]
+
+                    @info "Sending command... $target_angle, $target_velo"
+
+                    cmd = VehicleCommand(target_angle, target_velo, true)
+                    serialize(socket, cmd)
+
+                    current_step+=1
+                end     
+            end
+        end
     end
+
+end
+
+# this is prob wrong but we rolling with it for now
+function QuaternionToYaw(q::SVector{4, Float64} = SVector(1.0, 0.0, 0.0, 0.0))
+    # roll (x-axis rotation)
+    sinr_cosp = 2 * (q.w * q.x + q.y * q.z)
+    cosr_cosp = 1 - 2 * (q.x * q.x + q.y * q.y)
+    roll = atan(sinr_cosp, cosr_cosp)
+
+    # pitch (y-axis rotation)
+    sinp = sqrt(1 + 2 * (q.w * q.y - q.x * q.z))
+    cosp = sqrt(1 - 2 * (q.w * q.y - q.x * q.z))
+    pitch = 2 * atan(sinp, cosp) - π / 2
+
+    # yaw (z-axis rotation)
+    siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+    yaw = atan(siny_cosp, cosy_cosp)
+
+    (yaw)
 end
 
 function isfull(ch::Channel)
     length(ch.data) ≥ ch.sz_max
 end
-
 
 function my_client(host::IPAddr=IPv4(0), port=4444)
     socket = Sockets.connect(host, port)
@@ -99,7 +320,7 @@ function my_client(host::IPAddr=IPv4(0), port=4444)
     localization_state_channel = Channel{GroundTruthMeasurement}(1)
     perception_state_channel = Channel{MyPerceptionType}(1)
 
-    target_map_segment = 0 # (not a valid segment, will be overwritten by message)
+    # target_map_segment = 0 # (not a valid segment, will be overwritten by message)
     ego_vehicle_id = 0 # (not a valid id, will be overwritten by message. This is used for discerning ground-truth messages)
 
     errormonitor(@async while true
@@ -126,8 +347,6 @@ function my_client(host::IPAddr=IPv4(0), port=4444)
         !received && continue
         target_map_segment = measurement_msg.target_segment
 
-
-       
         ego_vehicle_id = measurement_msg.vehicle_id
         for meas in measurement_msg.measurements
 
@@ -143,8 +362,8 @@ function my_client(host::IPAddr=IPv4(0), port=4444)
         end
     end)
 
-    # @async localize(gps_channel, imu_channel, localization_state_channel)
-    # @async perception(cam_channel, localization_state_channel, perception_state_channel)
-    # @async decision_making(localization_state_channel, perception_state_channel, gt_state_channel,  map, socket)
-    @async decision_making(localization_state_channel, nothing, gt_channel,  map, socket)
+    @async localize(gps_channel, imu_channel, localization_state_channel)
+    @async perception(cam_channel, localization_state_channel, perception_state_channel)
+    @async decision_making(localization_state_channel, perception_state_channel, map, socket)
+    @async test_algorithms(gt_channel, localization_state_channel, perception_state_channel, ego_vehicle_id)
 end

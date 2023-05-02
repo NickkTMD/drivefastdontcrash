@@ -1,5 +1,9 @@
 function get_vis(map=nothing, open_vis=true, host::IPAddr = ip"127.0.0.1", default_port=8700)
     vis = @suppress Visualizer(MeshCat.CoreVisualizer(host, default_port), ["meshcat"])
+
+    setprop!(vis[:camera], "near", 0.1)
+    setprop!(vis[:camera], "far", 250.0)
+
     if !isnothing(map)
         view_map(vis, map)
     end
