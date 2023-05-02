@@ -30,7 +30,6 @@ function my_convert_to_pixel(num_pixels, pixel_len, px)
 end
 
 function get_cam_transform_standard_matrix(camera_id)
-    # TODO load this from URDF
     R_cam_to_body = [
         0.9998 0.0 0.0199987;
         0.0 1.0 0.0;
@@ -44,23 +43,28 @@ function get_cam_transform_standard_matrix(camera_id)
     T = [R_cam_to_body t_cam_to_body]
 end
 
+function convert_from_pixel(num_pixels, pixel_len, pix_id)
+    min_val = -pixel_len*num_pixels/2
+    px = min_val + (pix_id-1)*pixel_len
+    return px
+end
+
 function simple_state_from_camera_projection(bbox, ego_state, camera_id; focal_len = 0.01, pixel_len = 0.001, image_width = 640, image_height = 480)
     vehicle_size = SVector(13.2, 5.7, 5.3)
 
     # TODO: Might not need to convert from pixels, id might be fine? 
-    top = bbox[1]   # convert_from_pixel(image_height, pixel_len, bbox[1]) 
+    top = bbox[1]   # convert_from_pixel(image_height, pixel_len, bbox[1])  
     bot = bbox[2]   # convert_from_pixel(image_height, pixel_len, bbox[3]) 
     left = bbox[3]  # convert_from_pixel(image_width, pixel_len, bbox[2]) 
     right = bbox[4] # convert_from_pixel(image_width, pixel_len, bbox[4]) 
+    # top = convert_from_pixel(image_height, pixel_len, bbox[1])  
+    # bot = convert_from_pixel(image_height, pixel_len, bbox[3]) 
+    # left = convert_from_pixel(image_width, pixel_len, bbox[2]) 
+    # right = convert_from_pixel(image_width, pixel_len, bbox[4]) 
      
-    # TODO: if I trace this ray on the map
-    # segments, where does this cross a road segment? This could be fancy
-    # start with simple
-
     x_center = (left + right) / 2
     y_center = (top + bot) / 2
 
-    # TODO: This might be negative
     box_pixel_width = right - left
     box_pixel_height = bot - top 
 
@@ -80,7 +84,11 @@ function simple_state_from_camera_projection(bbox, ego_state, camera_id; focal_l
 
     x_normalized = (x_center - image_width / 2) * pixel_len / focal_len
     y_normalized = (y_center - image_height / 2) * pixel_len / focal_len
-    
+
+    # @info "normalized"
+    # @info x_normalized
+    # @info y_normalized
+
     x_cam = x_normalized * depth_avg
     y_cam = y_normalized * depth_avg
     z_cam = depth_avg
@@ -89,20 +97,16 @@ function simple_state_from_camera_projection(bbox, ego_state, camera_id; focal_l
     world_coords = T_world_camrot * cam_coords
     x_world, y_world, z_world = Tuple(world_coords)
 
-    # On average, size of bounding box should be 8 meters, # of pixels is 100 pixels
-    # if you undo that scaling, if this is 8 meters and this number of pixels
-    # then that will tell you how far away this thing is. You can infer X, Y, and Z
-    # using that depth. Does this correspond to any lane segments, which then you 
-    # can get speed limit and direction of lane to init heading
+    # @info "world"
+    # @info x_world
+    # @info y_world
+    # @info z_world
 
-    # Assume heading and size and that centers are p1 and p2? 
-    
-    # TODO: ego velo is a vector
     SimpleVehicleState(
         x_world, 
         y_world, 
         extract_yaw_from_quaternion(ego_state.orientation), 
-        ego_state.velocity[1], # TODO: vector only has 3? 
+        ego_state.velocity[1], 
         vehicle_size[1], 
         vehicle_size[2], 
         vehicle_size[3]
@@ -213,21 +217,6 @@ function jac_hx(x_vec, ego, camera_id)
     return ForwardDiff.jacobian(st -> h(st, ego, camera_id), x_vec)
 end
 
-#function jac_hx(x, ego, camera_id)
-#    # Vehicle state -> 8 2d pixels
-#    state = [x.p1 x.p2 x.θ x.v x.l x.w x.h]
-#
-#    jac_proj = ForwardDiff.jacobian(x_state -> _corner_projections_from_simple_state(x_state, ego, camera_id), state)
-#    projected_points = _corner_projections_from_simple_state(state, ego, camera_id)
-#    # Potentially do this by hand
-#    jac_bbox = ForwardDiff.jacobian(proj -> _bounding_box_from_projected_points(proj), projected_points) 
-#
-#    println(size(jac_proj))
-#    println(jac_bbox)
-#
-#    return jac_bbox * jac_proj
-#end 
-
 struct VehicleEKF 
     μ::SimpleVehicleState
     Σ::Matrix
@@ -274,10 +263,31 @@ struct EgoState
     angular_velocity::SVector{3, Float64} # angular velocity around x,y,z axes
 end
 
-function perception(cam_meas_channel, localization_state_channel, perception_state_channel)
-    # set up stuff
 
+# Function to append data to CSV file for evalauting results 
+# function append_to_csv(file, data)
+#     row = DataFrame(data)
+# 
+#     open(file, "a") do io
+#         CSV.write(io, row, writeheader=false, append=true)
+#     end
+# end
+
+function perception(cam_meas_channel, localization_state_channel, perception_state_channel, gt_channel_for_test)
+    # set up stuff
     vehicles = VehicleEKF[]
+
+    # Create a CSV for tracking results
+    # csv_file = "results_2.csv"
+    # 
+    # try
+    # # Create a new CSV file with the specified headers
+    #     CSV.write(csv_file, DataFrame(iteration=Int[], x=Float64[], y=Float64[]))
+    # catch e
+    #     @warn e
+    # end
+
+    # @info "created CSV" 
 
     proc_cov = [
         .01 0 0 0 0 0 0; 
@@ -287,15 +297,17 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         0 0 0 0 .001 0 0; 
         0 0 0 0 0 .001 0;  
         0 0 0 0 0 0 .001; 
-    ] # TODO: Constant diag matrix
+    ] 
     meas_var = [
         5 0 0 0;
         0 5 0 0;
         0 0 5 0;
         0 0 0 5;
-    ] # TODO: Constant diag matrix
+    ]
 
     last_time = 0.0
+
+    iteration = 0 
 
     try
         while true
@@ -314,9 +326,21 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
 
             fresh_cam_meas = sort(fresh_cam_meas, by=x -> x.time)
 
-            latest_localization_state = fetch(localization_state_channel)
+            latest_ego = nothing
 
-            latest_ego = latest_localization_state # add x
+            while isready(localization_state_channel)
+                sleep(0.001)
+                latest_localization_state = fetch(localization_state_channel)
+                # For testing with ground truth, assumes ego is 1 
+                if latest_localization_state.vehicle_id == 1 
+                    latest_ego = latest_localization_state
+                    break
+                end 
+            end
+
+            if latest_ego == nothing
+                continue
+            end
 
             for cam_meas in fresh_cam_meas
                 sleep(0.001)
@@ -360,8 +384,6 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
                     C = jac_hx(μ̂, ego_extrap, cam_meas.camera_id)
                     d = pred_z - C*μ̂
 
-                    print(unassoc_bboxes)
-
                     # Associate vehicle measurement prediction with bbox from meas
                     assoc_idx, assoc_bbox = associate_bbox_with_vehicle(pred_z, unassoc_bboxes)
 
@@ -392,7 +414,7 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
                 for bbox in unassoc_bboxes 
                     sleep(0.001)
                     μ = simple_state_from_camera_projection(bbox, ego_extrap, cam_meas.camera_id)
-                    Σ = proc_cov # TODO: Confirm
+                    Σ = proc_cov 
                     push!(vehicles, VehicleEKF(μ, Σ))
                 end
 
@@ -400,8 +422,34 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
             end
 
             states = [veh.μ for veh in vehicles]
-
             perception_state = MyPerceptionType(time(), states)
+
+            freshest_gt_message = nothing
+            latest_time = -Inf
+
+            # Testing
+            while isready(gt_channel_for_test)
+                sleep(0.001)
+                # @info "getting groundtruth"
+                gt = take!(gt_channel_for_test)
+                # Assumes ego_id is 1, since this is using fake localize
+                if gt.vehicle_id != 1 && gt.time > latest_time
+                    freshest_gt_message = gt
+                    latest_time = gt.time
+                end
+            end
+
+            data = Dict("iteration" => iteration,
+                        "x" => perception_state.x[1].p1,
+                        "y" => perception_state.x[1].p2)
+
+            @info data
+
+            iteration += 1
+
+            # Append to CSV for tracking results
+            # append_to_csv(csv_file, data)
+
             if isready(perception_state_channel)
                 take!(perception_state_channel)
             end
